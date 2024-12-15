@@ -23,14 +23,13 @@ from tqdm import tqdm
 logging_enabled = False
 log_file = "debug.log"
 
-# Last 10 years of data:
-start_date = "2023-01-01"
-end_date = "2023-12-31"
+start_date = "2012-01-01"
+end_date = "2024-11-30"
 
 latitude_bounds = (57.5, 70)
 longitude_bounds = (4.5, 15)
-grid_resolution = 4
-num_interp_points = grid_resolution*grid_resolution
+grid_resolution = 20
+num_interp_points = grid_resolution * grid_resolution
 output_json = "binned_nighttime_clouds.json"
 tz = pytz.timezone("Europe/Oslo")
 
@@ -59,12 +58,9 @@ def compute_fig_size():
     lat_diff = latitude_bounds[1] - latitude_bounds[0]
     lon_diff = longitude_bounds[1] - longitude_bounds[0]
     aspect_ratio = lon_diff / lat_diff
-
-    # Assuming a base height of 10 units
     base_height = 10
     width = base_height * aspect_ratio
     height = base_height
-
     return (width, height)
 
 def get_night_start_date(row):
@@ -77,18 +73,8 @@ def get_night_start_date(row):
     else:
         return None
 
-def determine_missing_dates(lat, lon, start_date, end_date):
-    """Check the cache for existing data and determine which daily ranges are missing."""
-    cache_file = f".cache/cache_{lat}_{lon}.json"
-    if os.path.exists(cache_file):
-        with open(cache_file, "r") as f:
-            cached_data = json.load(f)
-    else:
-        cached_data = {}
-
-    # cached_data: { "YYYY-MM-DD": {"average": val}, ... }
-
-    # Generate all dates in the requested range
+def all_dates_in_range(start_date, end_date):
+    """Return a list of all dates between start_date and end_date inclusive."""
     start_dt = datetime.fromisoformat(start_date)
     end_dt = datetime.fromisoformat(end_date)
     all_dates = []
@@ -96,29 +82,56 @@ def determine_missing_dates(lat, lon, start_date, end_date):
     while current <= end_dt:
         all_dates.append(current.date())
         current += timedelta(days=1)
+    return all_dates
 
-    missing_dates = [d for d in all_dates if d.isoformat() not in cached_data]
-    return missing_dates, cached_data
+def yearly_intervals(start_date, end_date):
+    """Generate (year_start, year_end) tuples for each year in the range."""
+    start_dt = datetime.fromisoformat(start_date)
+    end_dt = datetime.fromisoformat(end_date)
 
-def fetch_daily_data(lat, lon, date_str, session):
-    """Fetch data from the API for a single day."""
-    openmeteo = openmeteo_requests.Client(session=session)
+    intervals = []
+    current_year = start_dt.year
+    while current_year <= end_dt.year:
+        year_start = datetime(current_year, 1, 1)
+        year_end = datetime(current_year, 12, 31)
+        if year_start < start_dt:
+            year_start = start_dt
+        if year_end > end_dt:
+            year_end = end_dt
+        intervals.append((year_start.date().isoformat(), year_end.date().isoformat()))
+        current_year += 1
+    return intervals
+
+def load_cache(lat, lon):
+    cache_file = f".cache/cache_{lat}_{lon}.json"
+    if os.path.exists(cache_file):
+        with open(cache_file, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_cache(lat, lon, data):
+    cache_file = f".cache/cache_{lat}_{lon}.json"
+    with open(cache_file, "w") as f:
+        json.dump(data, f, indent=2)
+
+def fetch_yearly_data(lat, lon, start_yr, end_yr, session):
+    """Fetch data for one entire year range."""
     url = "https://archive-api.open-meteo.com/v1/archive"
     params = {
         "latitude": lat,
         "longitude": lon,
-        "start_date": date_str,
-        "end_date": date_str,
+        "start_date": start_yr,
+        "end_date": end_yr,
         "hourly": "cloud_cover"
     }
 
     while True:
         try:
-            responses = openmeteo.weather_api(url, params=params)
+            responses = openmeteo_requests.Client(session=session).weather_api(url, params=params)
             response = responses[0]
             break
         except Exception:
-            time.sleep(62)
+            time.sleep(60)
             continue
 
     hourly = response.Hourly()
@@ -144,60 +157,83 @@ def fetch_daily_data(lat, lon, date_str, session):
     df["night_start_date"] = df.apply(get_night_start_date, axis=1)
     df_night = df[df["night_start_date"].notnull()]
 
-    # Compute nightly averages for this date (should be just one night_start_date)
-    nightly_averages = {}
+    yearly_averages = {}
     for night_date, group in df_night.groupby("night_start_date"):
         night_str = night_date.isoformat()
         avg_cc = group["cloud_cover"].mean() if len(group) > 0 else np.nan
-        nightly_averages[night_str] = {"average": float(avg_cc)}
+        yearly_averages[night_str] = {"average": float(avg_cc)}
 
-    return nightly_averages
-
-def update_cache(lat, lon, new_data):
-    """Merge new data into the cache file for the given lat/lon."""
-    cache_file = f".cache/cache_{lat}_{lon}.json"
-    if os.path.exists(cache_file):
-        with open(cache_file, "r") as f:
-            cached_data = json.load(f)
-    else:
-        cached_data = {}
-
-    for night_str, vals in new_data.items():
-        cached_data[night_str] = vals
-
-    with open(cache_file, "w") as f:
-        json.dump(cached_data, f, indent=2)
+    return yearly_averages
 
 def process_location(lat, lon, start_date, end_date):
     ensure_cache_dir()
-
-    # Setup a cached session for requests
     cache_session = requests_cache.CachedSession('.requests_http_cache', expire_after=-1)
     retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
 
-    # Determine which dates are missing from the cache
-    missing_dates, cached_data = determine_missing_dates(lat, lon, start_date, end_date)
+    # Load existing data
+    cached_data = load_cache(lat, lon)
 
-    # Fetch missing data day-by-day
-    for d in missing_dates:
-        d_str = d.isoformat()
-        daily_data = fetch_daily_data(lat, lon, d_str, retry_session)
-        # Merge into cache
-        update_cache(lat, lon, daily_data)
+    all_dates_list = all_dates_in_range(start_date, end_date)
+    existing_nights = set(cached_data.keys())
+    # Filter to only valid ISO date keys
+    existing_nights = {d for d in existing_nights if is_iso_date(d)}
 
-    # Reload the full cache after updates
-    cache_file = f".cache/cache_{lat}_{lon}.json"
-    with open(cache_file, "r") as f:
-        final_cached_data = json.load(f)
+    all_dates_str = {d.isoformat() for d in all_dates_list}
+    missing_nights = all_dates_str - existing_nights
 
-    nightly_averages = final_cached_data
-    return (lat, lon, nightly_averages)
+    # If missing_nights is empty, we already have all data
+    # If not, we need to fetch data for those years
+    # Group missing nights by year
+    while missing_nights:
+        years_needed = {}
+        for mn in missing_nights:
+            y = datetime.fromisoformat(mn).year
+            if y not in years_needed:
+                years_needed[y] = []
+            years_needed[y].append(mn)
+
+        # For each year needed, fetch that entire year
+        year_intervals = yearly_intervals(start_date, end_date)
+        # year_intervals gives us start/end for each year in the range
+        # We only fetch years that have missing nights
+        for (ystart, yend) in year_intervals:
+            y = datetime.fromisoformat(ystart).year
+            if y in years_needed:
+                # Fetch this year
+                yearly_data = fetch_yearly_data(lat, lon, ystart, yend, retry_session)
+                # Merge into cache
+                for k, v in yearly_data.items():
+                    cached_data[k] = v
+                save_cache(lat, lon, cached_data)
+
+        # Recalculate missing_nights after fetching
+        cached_data = load_cache(lat, lon)
+        existing_nights = set(d for d in cached_data.keys() if is_iso_date(d))
+        missing_nights = all_dates_str - existing_nights
+
+        # If after fetching all needed years some nights still missing, they might just not exist in the data.
+        # Usually should not happen. We will break out if no improvement is possible.
+        # But let's trust the API that we got all data now.
+
+        # If the API doesn't provide all nights, missing_nights might remain.
+        # We'll just continue with what we have.
+
+        break  # We did one pass of fetching needed years. In normal conditions, this should fill everything.
+
+    return (lat, lon, cached_data)
+
+def is_iso_date(s):
+    # Check if s is a valid ISO date (YYYY-MM-DD)
+    try:
+        datetime.fromisoformat(s)
+        return True
+    except ValueError:
+        return False
 
 def process_args(args):
     return process_location(*args)
 
 def determine_season(date):
-    # date is a datetime.date
     m = date.month
     if (m == 12) or (m == 1) or (m == 2):
         return "Winter"
@@ -252,16 +288,16 @@ def plot_map(locs, lon_mesh, lat_mesh, interpolated_clouds, title, outfile):
     ax.add_feature(states_provinces, edgecolor='gray')
 
     if interpolated_clouds is not None:
-        levels = np.linspace(0, 100, 11)
+        levels = np.linspace(20, 100, 9)
         contour = ax.contourf(lon_mesh, lat_mesh, interpolated_clouds,
-                              levels=levels,
-                              cmap='YlGnBu',
-                              vmin=0,
-                              vmax=100,
-                              transform=ccrs.PlateCarree())
+            levels=levels,
+            cmap='YlGnBu',
+            vmin=20,
+            vmax=100,
+            transform=ccrs.PlateCarree())
         cbar = plt.colorbar(contour, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
         cbar.set_label('Average Nighttime Cloud Cover (%)')
-        ax.scatter(locs[:,0], locs[:,1], c='white', edgecolor='black',
+        ax.scatter(locs[:,0], locs[:,1], c='black',
                    transform=ccrs.PlateCarree(), s=4)
         plt.title(title)
         plt.savefig(outfile)
@@ -272,14 +308,10 @@ def plot_map(locs, lon_mesh, lat_mesh, interpolated_clouds, title, outfile):
     plt.close(fig)
 
 def main():
-    # Define the grid of points with additional buffer points
-    buffer = 1 # Add points 1 degree outside the bounds
-    
-    # Extend the bounds for the grid
+    buffer = 1.0
     extended_lat_bounds = (latitude_bounds[0] - buffer, latitude_bounds[1] + buffer)
     extended_lon_bounds = (longitude_bounds[0] - buffer, longitude_bounds[1] + buffer)
-    
-    # Create grid with extended bounds
+
     lats = np.linspace(extended_lat_bounds[0], extended_lat_bounds[1], grid_resolution)
     lons = np.linspace(extended_lon_bounds[0], extended_lon_bounds[1], grid_resolution)
 
@@ -289,11 +321,8 @@ def main():
     logging.info(f"Date range: {start_date} to {end_date}")
 
     binned_data = {}
-    # Process in parallel with a progress bar
     with ProcessPoolExecutor() as executor:
         futures = [executor.submit(process_args, t) for t in tasks]
-
-        # Display a progress bar for the completed tasks
         for f in tqdm(as_completed(futures), total=total_points, desc="Processing grid points"):
             lat, lon, nightly_averages = f.result()
             loc_key = f"{lat}_{lon}"
@@ -301,28 +330,28 @@ def main():
 
     logging.info("All points processed. Converting to DataFrame and computing seasonal averages.")
 
-    # Convert binned_data to a DataFrame
     rows = []
     for loc_key, nights in binned_data.items():
         lat_str, lon_str = loc_key.split("_")
         lat_val = float(lat_str)
         lon_val = float(lon_str)
+
+        # Filter only valid ISO date keys and valid data
         for night_str, vals in nights.items():
-            avg_val = vals["average"]
-            date_val = datetime.fromisoformat(night_str).date()
-            rows.append((lat_val, lon_val, date_val, avg_val))
+            if is_iso_date(night_str) and isinstance(vals, dict) and "average" in vals:
+                avg_val = vals["average"]
+                date_val = datetime.fromisoformat(night_str).date()
+                rows.append((lat_val, lon_val, date_val, avg_val))
 
     df_all = pd.DataFrame(rows, columns=["lat", "lon", "date", "average"])
-    # Determine season
     df_all["season"] = df_all["date"].apply(determine_season)
 
-    # Compute overall averages (all data)
+    # Compute overall averages
     df_overall = df_all.groupby(["lat", "lon"])["average"].mean().reset_index()
 
-    # Compute seasonal averages across years
+    # Compute seasonal averages
     df_seasonal = df_all.groupby(["lat", "lon", "season"])["average"].mean().reset_index()
 
-    # Save the raw nightly averages to JSON if logging is enabled
     if logging_enabled == True:
         try:
             with open(output_json, "w") as f:
