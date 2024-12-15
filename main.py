@@ -12,7 +12,10 @@ from datetime import timedelta, datetime
 import pytz
 import logging
 import sys
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import os
+import time
+from tqdm import tqdm
 
 ###############################################
 # CONFIGURATION
@@ -21,12 +24,12 @@ logging_enabled = False
 log_file = "debug.log"
 
 # Last 10 years of data:
-start_date = "2020-01-01"
-end_date = "2024-11-30"
+start_date = "2023-01-01"
+end_date = "2023-12-31"
 
 latitude_bounds = (57.5, 70)
 longitude_bounds = (4.5, 15)
-grid_resolution = 20
+grid_resolution = 4
 num_interp_points = grid_resolution*grid_resolution
 output_json = "binned_nighttime_clouds.json"
 tz = pytz.timezone("Europe/Oslo")
@@ -47,6 +50,10 @@ logging.info("Program started.")
 ###############################################
 # HELPER FUNCTIONS
 ###############################################
+
+def ensure_cache_dir():
+    if not os.path.exists('.cache'):
+        os.makedirs('.cache')
 
 def compute_fig_size():
     lat_diff = latitude_bounds[1] - latitude_bounds[0]
@@ -70,22 +77,49 @@ def get_night_start_date(row):
     else:
         return None
 
-def process_location(lat, lon, start_date, end_date):
-    cache_session = requests_cache.CachedSession('.cache', expire_after=-1)
-    retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
-    openmeteo = openmeteo_requests.Client(session=retry_session)
+def determine_missing_dates(lat, lon, start_date, end_date):
+    """Check the cache for existing data and determine which daily ranges are missing."""
+    cache_file = f".cache/cache_{lat}_{lon}.json"
+    if os.path.exists(cache_file):
+        with open(cache_file, "r") as f:
+            cached_data = json.load(f)
+    else:
+        cached_data = {}
 
+    # cached_data: { "YYYY-MM-DD": {"average": val}, ... }
+
+    # Generate all dates in the requested range
+    start_dt = datetime.fromisoformat(start_date)
+    end_dt = datetime.fromisoformat(end_date)
+    all_dates = []
+    current = start_dt
+    while current <= end_dt:
+        all_dates.append(current.date())
+        current += timedelta(days=1)
+
+    missing_dates = [d for d in all_dates if d.isoformat() not in cached_data]
+    return missing_dates, cached_data
+
+def fetch_daily_data(lat, lon, date_str, session):
+    """Fetch data from the API for a single day."""
+    openmeteo = openmeteo_requests.Client(session=session)
     url = "https://archive-api.open-meteo.com/v1/archive"
     params = {
         "latitude": lat,
         "longitude": lon,
-        "start_date": start_date,
-        "end_date": end_date,
+        "start_date": date_str,
+        "end_date": date_str,
         "hourly": "cloud_cover"
     }
 
-    responses = openmeteo.weather_api(url, params=params)
-    response = responses[0]
+    while True:
+        try:
+            responses = openmeteo.weather_api(url, params=params)
+            response = responses[0]
+            break
+        except Exception:
+            time.sleep(62)
+            continue
 
     hourly = response.Hourly()
     times = pd.date_range(
@@ -110,13 +144,53 @@ def process_location(lat, lon, start_date, end_date):
     df["night_start_date"] = df.apply(get_night_start_date, axis=1)
     df_night = df[df["night_start_date"].notnull()]
 
-    # Compute nightly averages for this location
+    # Compute nightly averages for this date (should be just one night_start_date)
     nightly_averages = {}
     for night_date, group in df_night.groupby("night_start_date"):
         night_str = night_date.isoformat()
         avg_cc = group["cloud_cover"].mean() if len(group) > 0 else np.nan
         nightly_averages[night_str] = {"average": float(avg_cc)}
 
+    return nightly_averages
+
+def update_cache(lat, lon, new_data):
+    """Merge new data into the cache file for the given lat/lon."""
+    cache_file = f".cache/cache_{lat}_{lon}.json"
+    if os.path.exists(cache_file):
+        with open(cache_file, "r") as f:
+            cached_data = json.load(f)
+    else:
+        cached_data = {}
+
+    for night_str, vals in new_data.items():
+        cached_data[night_str] = vals
+
+    with open(cache_file, "w") as f:
+        json.dump(cached_data, f, indent=2)
+
+def process_location(lat, lon, start_date, end_date):
+    ensure_cache_dir()
+
+    # Setup a cached session for requests
+    cache_session = requests_cache.CachedSession('.requests_http_cache', expire_after=-1)
+    retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
+
+    # Determine which dates are missing from the cache
+    missing_dates, cached_data = determine_missing_dates(lat, lon, start_date, end_date)
+
+    # Fetch missing data day-by-day
+    for d in missing_dates:
+        d_str = d.isoformat()
+        daily_data = fetch_daily_data(lat, lon, d_str, retry_session)
+        # Merge into cache
+        update_cache(lat, lon, daily_data)
+
+    # Reload the full cache after updates
+    cache_file = f".cache/cache_{lat}_{lon}.json"
+    with open(cache_file, "r") as f:
+        final_cached_data = json.load(f)
+
+    nightly_averages = final_cached_data
     return (lat, lon, nightly_averages)
 
 def process_args(args):
@@ -124,20 +198,7 @@ def process_args(args):
 
 def determine_season(date):
     # date is a datetime.date
-    # Define meteorological seasons:
-    # Winter: Dec 1 - Feb 28/29
-    # Spring: Mar 1 - May 31
-    # Summer: Jun 1 - Aug 31
-    # Autumn: Sep 1 - Nov 30
-    # We'll use month/day logic:
     m = date.month
-
-    # Winter: Dec, Jan, Feb
-    # Spring: Mar, Apr, May
-    # Summer: Jun, Jul, Aug
-    # Autumn: Sep, Oct, Nov
-
-    # Alternatively:
     if (m == 12) or (m == 1) or (m == 2):
         return "Winter"
     elif m in [3, 4, 5]:
@@ -176,7 +237,6 @@ def plot_map(locs, lon_mesh, lat_mesh, interpolated_clouds, title, outfile):
     ax.set_extent([longitude_bounds[0], longitude_bounds[1], latitude_bounds[0], latitude_bounds[1]], crs=ccrs.PlateCarree())
     ax.set_title(f"Center: ({center_lat:.2f}, {center_lon:.2f})")
 
-     # Create a feature for States/Admin 1 regions at 1:50m from Natural Earth
     states_provinces = cfeature.NaturalEarthFeature(
         category='cultural',
         name='admin_1_states_provinces_lines',
@@ -194,15 +254,15 @@ def plot_map(locs, lon_mesh, lat_mesh, interpolated_clouds, title, outfile):
     if interpolated_clouds is not None:
         levels = np.linspace(0, 100, 11)
         contour = ax.contourf(lon_mesh, lat_mesh, interpolated_clouds,
-                            levels=levels,
-                            cmap='YlGnBu',
-                            vmin=0,
-                            vmax=100,
-                            transform=ccrs.PlateCarree())
+                              levels=levels,
+                              cmap='YlGnBu',
+                              vmin=0,
+                              vmax=100,
+                              transform=ccrs.PlateCarree())
         cbar = plt.colorbar(contour, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
         cbar.set_label('Average Nighttime Cloud Cover (%)')
         ax.scatter(locs[:,0], locs[:,1], c='white', edgecolor='black',
-                   transform=ccrs.PlateCarree(), s=10)
+                   transform=ccrs.PlateCarree(), s=4)
         plt.title(title)
         plt.savefig(outfile)
         logging.info(f"Map plotted and saved to {outfile}")
@@ -213,7 +273,7 @@ def plot_map(locs, lon_mesh, lat_mesh, interpolated_clouds, title, outfile):
 
 def main():
     # Define the grid of points with additional buffer points
-    buffer = 1.0  # Add points 1 degree outside the bounds
+    buffer = 1 # Add points 1 degree outside the bounds
     
     # Extend the bounds for the grid
     extended_lat_bounds = (latitude_bounds[0] - buffer, latitude_bounds[1] + buffer)
@@ -228,15 +288,16 @@ def main():
     logging.info(f"Number of points to process: {total_points}")
     logging.info(f"Date range: {start_date} to {end_date}")
 
-    # Parallel processing of locations
     binned_data = {}
+    # Process in parallel with a progress bar
     with ProcessPoolExecutor() as executor:
-        results = list(executor.map(process_args, tasks))
+        futures = [executor.submit(process_args, t) for t in tasks]
 
-    # Aggregate results
-    for (lat, lon, nightly_averages) in results:
-        loc_key = f"{lat}_{lon}"
-        binned_data[loc_key] = nightly_averages
+        # Display a progress bar for the completed tasks
+        for f in tqdm(as_completed(futures), total=total_points, desc="Processing grid points"):
+            lat, lon, nightly_averages = f.result()
+            loc_key = f"{lat}_{lon}"
+            binned_data[loc_key] = nightly_averages
 
     logging.info("All points processed. Converting to DataFrame and computing seasonal averages.")
 
@@ -261,7 +322,7 @@ def main():
     # Compute seasonal averages across years
     df_seasonal = df_all.groupby(["lat", "lon", "season"])["average"].mean().reset_index()
 
-    # Save the raw nightly averages to JSON
+    # Save the raw nightly averages to JSON if logging is enabled
     if logging_enabled == True:
         try:
             with open(output_json, "w") as f:
