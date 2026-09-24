@@ -12,16 +12,19 @@ from __future__ import annotations
 
 import argparse
 import io
+import atexit
 import multiprocessing
 import os
 import re
+import signal
+import sys
 import threading
 import webbrowser
 
 import numpy as np
 from flask import Flask, Response, jsonify, render_template, request, send_file
 
-from cloudcover import analysis, diagnostics, fetch, jobs
+from cloudcover import analysis, container, diagnostics, fetch, jobs
 from cloudcover.config import Settings, SettingsError
 
 # cloudcover.render pulls in matplotlib and cartopy, which take seconds to
@@ -310,31 +313,80 @@ def main():
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument(
+        "--no-docker", action="store_true",
+        help="Do not manage the archive container; use the public Open-Meteo tier.",
+    )
+    parser.add_argument(
         "--archive-url",
-        help="Base archive endpoint. Point at a self-hosted Open-Meteo "
-             "(http://127.0.0.1:8080/v1/archive) to drop the public rate limits.",
+        help="Point at an archive endpoint you run yourself. Implies --no-docker.",
     )
     args = parser.parse_args()
 
+    # Decide the archive before anything forks: worker processes inherit the
+    # environment, and they must all agree on where the data comes from.
+    started_container = False
     if args.archive_url:
-        # Set before anything forks: worker processes inherit the environment.
         os.environ["CLOUDCOVER_ARCHIVE_URL"] = args.archive_url
         fetch.ARCHIVE_URL = args.archive_url
+    elif not args.no_docker:
+        try:
+            started_container = container.start()
+        except container.ContainerError as exc:
+            print()
+            print(exc)
+            print()
+            return 1
+        os.environ["CLOUDCOVER_ARCHIVE_URL"] = container.LOCAL_ARCHIVE_URL
+        fetch.ARCHIVE_URL = container.LOCAL_ARCHIVE_URL
 
     url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '') else args.host}:{args.port}"
-    print(f"\n  Cloud Cover Explorer  ->  {url}")
+    print()
+    print(f"  Cloud Cover Explorer  ->  {url}")
     print(f"  Run + crash logs      ->  {os.path.abspath(diagnostics.LOG_DIR)}")
     tier = "self-hosted, no quota" if fetch.is_local_archive() else "public tier"
     print(f"  Archive               ->  {fetch.ARCHIVE_URL}  ({tier})")
+    if started_container:
+        print("  (container started by this process; it will stop on exit)")
     print()
+
     if not args.no_browser and not args.debug:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     threading.Thread(target=_prewarm_basemap, name="prewarm", daemon=True).start()
 
-    # The reloader would duplicate in-flight jobs, so it stays off.
-    app.run(host=args.host, port=args.port, debug=args.debug,
-            threaded=True, use_reloader=False)
+    # A container we started must come down however this process ends: Ctrl+C,
+    # a closed terminal, taskkill, or a clean return. Python installs no SIGBREAK
+    # handler of its own, so closing the console window would otherwise strand it.
+    done = threading.Event()
+
+    def cleanup():
+        if started_container and not done.is_set():
+            done.set()
+            container.stop()
+
+    def on_signal(signum, frame):
+        cleanup()
+        os._exit(0)
+
+    if started_container:
+        atexit.register(cleanup)
+        for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+            sig = getattr(signal, name, None)
+            if sig is not None:
+                try:
+                    signal.signal(sig, on_signal)
+                except (ValueError, OSError):
+                    pass
+
+    try:
+        # The reloader would duplicate in-flight jobs, so it stays off.
+        app.run(host=args.host, port=args.port, debug=args.debug,
+                threaded=True, use_reloader=False)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cleanup()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

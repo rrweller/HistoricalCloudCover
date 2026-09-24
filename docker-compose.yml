@@ -4,8 +4,13 @@
 # CLOUDCOVER_ARCHIVE_URL pointed here — no quota, no minutely/hourly/daily caps,
 # no concurrency ceiling.
 #
-#   docker compose up -d
-#   CLOUDCOVER_ARCHIVE_URL=http://127.0.0.1:8080/v1/archive python app.py
+# app.py brings this up on start and takes it down on exit, so you normally just
+# run the app. Starting it here by hand is still fine: the app then leaves it
+# alone on exit, which is handy for keeping the chunk cache warm between runs.
+#
+#   python app.py                  # manages the container for you
+#   python app.py --no-docker      # public tier instead, touches nothing
+#   docker compose up -d           # run it yourself; the app will adopt it
 #
 # In this default mode nothing is pre-downloaded: the server reads individual
 # chunks out of the S3 archive over HTTP range requests as queries ask for them,
@@ -24,7 +29,9 @@ services:
   openmeteo:
     image: ghcr.io/open-meteo/open-meteo
     container_name: open-meteo
-    restart: unless-stopped
+    # No restart policy: app.py starts this on launch and stops it on exit, and
+    # a container resurrecting itself after a reboot would outlive its owner.
+    restart: "no"
     ports:
       - "127.0.0.1:8080:8080"
     volumes:

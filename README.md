@@ -89,12 +89,29 @@ archive as open data plus a Docker image of the API server, and it serves the
 *same* HTTP API — so the app only needs pointing at it.
 
 ```
-docker compose up -d
-python app.py --archive-url http://127.0.0.1:8080/v1/archive
+python app.py
 ```
 
-or set `CLOUDCOVER_ARCHIVE_URL` in the environment. The startup banner says which
+That is the whole thing. The app starts the archive container on launch, waits
+for it to serve, and stops it again on exit. The startup banner says which
 archive is in use, and `GET /api/archive` reports whether it is reachable.
+
+| | |
+|---|---|
+| `python app.py` | manages the container for you |
+| `python app.py --no-docker` | public tier instead; Docker is not touched |
+| `python app.py --archive-url URL` | an archive you run elsewhere |
+| `docker compose up -d` first | the app adopts it and leaves it running on exit |
+
+Starting it yourself is worth doing if you want the chunk cache to stay warm
+between app restarts — the app only stops what it started.
+
+Shutdown is handled for Ctrl+C, a closed terminal and `taskkill`/SIGTERM. A
+force-kill (`taskkill /F`) runs no handler at all and strands the container; the
+next launch notices the orphan is one of ours and takes it down.
+
+If Docker is missing or asleep the app says so and exits, rather than quietly
+dropping you onto the rate-limited public tier.
 
 Nothing is pre-downloaded. OM-files are chunked spatially *and* temporally —
 roughly 3 x 3 grid cells by 120 timesteps, one to two kilobytes each — and the
