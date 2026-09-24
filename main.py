@@ -23,15 +23,15 @@ from tqdm import tqdm
 logging_enabled = False
 log_file = "debug.log"
 
-start_date = "2012-01-01"
-end_date = "2024-11-30"
+start_date = "2020-01-01"
+end_date = "2026-01-01"
 
-latitude_bounds = (57.5, 70)
-longitude_bounds = (4.5, 15)
-grid_resolution = 20
+latitude_bounds = (35,70)
+longitude_bounds = (-10,40)
+grid_resolution = 60
 num_interp_points = grid_resolution * grid_resolution
 output_json = "binned_nighttime_clouds.json"
-tz = pytz.timezone("Europe/Oslo")
+tz = pytz.timezone("Europe/London")
 
 if logging_enabled:
     logging.basicConfig(
@@ -58,7 +58,7 @@ def compute_fig_size():
     lat_diff = latitude_bounds[1] - latitude_bounds[0]
     lon_diff = longitude_bounds[1] - longitude_bounds[0]
     aspect_ratio = lon_diff / lat_diff
-    base_height = 10
+    base_height = 12
     width = base_height * aspect_ratio
     height = base_height
     return (width, height)
@@ -283,22 +283,22 @@ def plot_map(locs, lon_mesh, lat_mesh, interpolated_clouds, title, outfile):
     ax.add_feature(cfeature.OCEAN)
     ax.add_feature(cfeature.COASTLINE)
     ax.add_feature(cfeature.BORDERS, linestyle=':')
-    ax.add_feature(cfeature.LAKES, alpha=0.5)
+    ax.add_feature(cfeature.LAKES, alpha=0.8)
     ax.add_feature(cfeature.RIVERS)
     ax.add_feature(states_provinces, edgecolor='gray')
 
     if interpolated_clouds is not None:
-        levels = np.linspace(20, 100, 9)
+        levels = np.linspace(0, 100, 11)
         contour = ax.contourf(lon_mesh, lat_mesh, interpolated_clouds,
             levels=levels,
             cmap='YlGnBu',
-            vmin=20,
+            vmin=0,
             vmax=100,
             transform=ccrs.PlateCarree())
         cbar = plt.colorbar(contour, ax=ax, orientation='vertical', fraction=0.046, pad=0.04)
         cbar.set_label('Average Nighttime Cloud Cover (%)')
         ax.scatter(locs[:,0], locs[:,1], c='black',
-                   transform=ccrs.PlateCarree(), s=4)
+                   transform=ccrs.PlateCarree(), s=1)
         plt.title(title)
         plt.savefig(outfile)
         logging.info(f"Map plotted and saved to {outfile}")
@@ -365,7 +365,7 @@ def main():
     vals_overall = df_overall["average"].values
     lon_mesh, lat_mesh, interpolated_clouds_overall = compute_interpolation(locs_overall, vals_overall, extended_lat_bounds, extended_lon_bounds, num_interp_points)
     plot_map(locs_overall, lon_mesh, lat_mesh, interpolated_clouds_overall,
-             f"Average Nighttime Cloud Cover in Norway\n({start_date} to {end_date})",
+             f"Average Nighttime Cloud Cover\n({start_date} to {end_date})",
              "map_output_overall.png")
 
     # Seasons
@@ -376,7 +376,7 @@ def main():
         vals_seas = df_seas["average"].values
         lon_mesh, lat_mesh, interpolated_clouds_seas = compute_interpolation(locs_seas, vals_seas, extended_lat_bounds, extended_lon_bounds, num_interp_points)
         plot_map(locs_seas, lon_mesh, lat_mesh, interpolated_clouds_seas,
-                 f"Average Nighttime Cloud Cover in Norway ({season})\n({start_date} to {end_date})",
+                 f"Average Nighttime Cloud Cover({season})\n({start_date} to {end_date})",
                  f"map_output_{season.lower()}.png")
 
     logging.info("Program finished successfully.")

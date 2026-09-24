@@ -166,3 +166,31 @@ def stop(log=print) -> None:
                 + (down.stderr or down.stdout or "").strip().splitlines()[-1] + ")")
     except (OSError, subprocess.SubprocessError) as exc:
         log(f"  (could not stop it: {type(exc).__name__}: {exc})")
+
+
+def sync_years(year_range: str, log=print) -> int:
+    """Download whole years of cloud cover into the container's volume.
+
+    The alternative - warming only the selected box - cannot work: the archive
+    sits on ERA5's N320 Gaussian grid at ~0.0703 degrees, so a box holds far too
+    many cells to enumerate, and any cell missed is a cold spot a finer grid
+    will find. Whole years are simpler, cheaper past a couple of degrees square,
+    and leave every point everywhere local.
+
+    About 5.14 GB per year. Streams progress straight through.
+    """
+    ok, detail = docker_available()
+    if not ok:
+        raise ContainerError(f"Cannot sync: {detail}")
+
+    log(f"  syncing copernicus_era5 cloud_cover for {year_range}")
+    log("  (about 5.14 GB per year; this runs once and then every run is local)")
+    proc = subprocess.Popen(
+        ["docker", "compose", "run", "--rm", "openmeteo", "sync",
+         "copernicus_era5", "cloud_cover", "--year", year_range],
+        cwd=PROJECT_ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    for line in proc.stdout:
+        log("    " + line.rstrip())
+    return proc.wait()

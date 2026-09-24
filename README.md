@@ -132,21 +132,37 @@ Measured on a 25-point, 3-year job (4 x 4 degree box, 8 workers):
 | Same region again, archive warm | **2.0s** | 0 MB |
 | Public tier, for comparison | ~8s | n/a, but quota-limited |
 
-37 MB against the 5,140 MB a single global year weighs — about 0.24% — which is
-the chunk-level fetching doing its job. Note the trade: a cold region is *slower*
-than the public API, because the container is pulling from S3 while open-meteo.com
-serves from its own warm storage. You win from the second query onward, and you
-never hit a quota.
+A cold region is *slower* than the public API, because the container pulls from
+S3 while open-meteo.com serves from its own warm storage. You win from the second
+query onward, and never hit a quota.
 
-Once you are working the same region repeatedly, or facing one large cold run,
-holding whole years locally removes the first-touch penalty entirely:
+### On-demand caching is per point, not per area
+
+Points are fetched individually, so **raising the grid resolution over the same
+box downloads cold again** — the finer grid lands between the chunks the coarser
+one pulled. Measured on one 4 x 4 degree box:
+
+| grid | points | pulled |
+|---|---|---|
+| 5 x 5 | 25 | 31 MB |
+| 9 x 9, same box | 81 | +28 MB |
+| 15 x 15, same box | 225 | +68 MB |
+
+Prefetching just the box looks like the fix and is not: the archive serves ERA5
+on its N320 Gaussian grid at about **0.0703 degrees** — successive cells come
+back as 15.00879, 15.07909, 15.14938 — so a 2 x 2 degree box holds ~840 cells and
+Europe ~355,000. Enumerating them costs far more than whole years, and any cell
+missed is a cold spot the next finer grid finds.
+
+### Syncing years is the fix
 
 ```
-docker compose run --rm openmeteo sync copernicus_era5 cloud_cover --past-days 2190
+python app.py --sync-years 2019-2024
 ```
 
-Cloud cover is about 5.1 GB per year globally — 443 GB for the full 1940-today
-archive — so six years is roughly 31 GB.
+About **5.14 GB per year**. Once done, every point is local at any resolution,
+for any region, and runs go at roughly 37 year-fetches/second. The footer shows
+the exact command for the range you have selected.
 
 With a self-hosted archive there is no quota: the daily-budget warning disappears
 and the worker ceiling rises from 12 to 64.

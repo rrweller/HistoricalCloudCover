@@ -307,7 +307,16 @@ def save_point(settings: Settings, lat: float, lon: float, days, sums, counts, y
 # ------------------------------------------------------------------- fetching
 
 
-def _request_year(lat: float, lon: float, start: str, end: str):
+def _plain_session():
+    """Uncached session, for requests whose responses we never want to keep."""
+    sess = getattr(_local, "plain", None)
+    if sess is None:
+        sess = retry(requests.Session(), retries=3, backoff_factor=0.3)
+        _local.plain = sess
+    return sess
+
+
+def _request_year(lat: float, lon: float, start: str, end: str, use_cache: bool = True):
     """One archive request.  Params match the original script's exactly so the
     pre-existing ``.requests_http_cache`` still serves them."""
     params = {
@@ -317,8 +326,9 @@ def _request_year(lat: float, lon: float, start: str, end: str):
         "end_date": end,
         "hourly": "cloud_cover",
     }
+    session = _session() if use_cache else _plain_session()
     try:
-        client = openmeteo_requests.Client(session=_session())
+        client = openmeteo_requests.Client(session=session)
         response = client.weather_api(ARCHIVE_URL, params=params)[0]
     except PERMANENT_ERRORS:
         # The response-cache layer is the usual suspect for this class of fault
@@ -614,6 +624,8 @@ def estimate(settings: Settings) -> dict:
         ((axis_lons >= settings.lon_min) & (axis_lons <= settings.lon_max)).sum()
     )
 
+    sync = sync_plan(settings) if is_local_archive() else None
+
     to_fetch = partial + missing
     years = len(settings.year_intervals())
     max_requests = to_fetch * years
@@ -634,6 +646,7 @@ def estimate(settings: Settings) -> dict:
         "points_inside": inside,
         "eta_seconds": round(eta),
         "eta_seconds_cold": round(eta_cold),
+        "sync_plan": sync,
         "over_daily_limit": (not is_local_archive()) and max_requests > DAILY_REQUEST_LIMIT,
         "daily_limit": DAILY_REQUEST_LIMIT,
         "ready": ready,
@@ -657,3 +670,19 @@ def archive_health() -> dict:
     except Exception as exc:
         return {"ok": False, "url": ARCHIVE_URL, "local": is_local_archive(),
                 "error": f"{type(exc).__name__}: {exc}"}
+
+
+# ------------------------------------------------------------ local archive
+
+GLOBAL_YEAR_GB = 5.14
+
+
+def sync_plan(settings: Settings) -> dict:
+    years = [int(a[:4]) for a, _ in settings.year_intervals()]
+    return {
+        "years": years,
+        "range": f"{min(years)}-{max(years)}" if years else "",
+        "gb": round(len(years) * GLOBAL_YEAR_GB, 1),
+        "command": ("docker compose run --rm openmeteo sync copernicus_era5 "
+                    f"cloud_cover --year {min(years)}-{max(years)}" if years else ""),
+    }

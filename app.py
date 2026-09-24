@@ -320,7 +320,22 @@ def main():
         "--archive-url",
         help="Point at an archive endpoint you run yourself. Implies --no-docker.",
     )
+    parser.add_argument(
+        "--sync-years", metavar="RANGE",
+        help="Download whole years into the local archive (e.g. 2019-2024, about "
+             "5.14 GB each) and exit. Afterwards every point is local at any "
+             "grid resolution.",
+    )
     args = parser.parse_args()
+
+    if args.sync_years:
+        try:
+            container.start()
+        except container.ContainerError as exc:
+            print()
+            print(exc)
+            return 1
+        return container.sync_years(args.sync_years)
 
     # Decide the archive before anything forks: worker processes inherit the
     # environment, and they must all agree on where the data comes from.

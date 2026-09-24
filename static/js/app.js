@@ -440,15 +440,11 @@ async function runEstimate() {
     if (data.to_fetch) {
       notes.push(`Up to ${fmtInt(data.max_requests)} archive requests across ${data.years} year${data.years === 1 ? '' : 's'}.`);
       notes.push('Each point is written to disk as it finishes, so an interrupted run resumes where it stopped.');
-      if (spread) {
-        notes.push('The upper figure is a region the local archive has not cached yet;'
-          + ' the lower one is a region it has.');
+      if (data.sync_plan) {
+        notes.push(`Points are fetched individually, so raising the grid resolution later `
+          + `re-downloads. To make this box free at any resolution, sync the years once `
+          + `(~${data.sync_plan.gb} GB): ${data.sync_plan.command}`);
       }
-    } else {
-      notes.push('Everything is on disk — this run will finish in seconds.');
-    }
-    if (data.unverified) {
-      notes.push(`${fmtInt(data.unverified)} points have a cache file that has not been indexed yet; the run will confirm their coverage.`);
     }
     els['est-note'].textContent = notes.join(' ');
 
