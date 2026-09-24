@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import math
 import threading
 import time
 
@@ -624,8 +625,7 @@ def estimate(settings: Settings) -> dict:
         ((axis_lons >= settings.lon_min) & (axis_lons <= settings.lon_max)).sum()
     )
 
-    sync = sync_plan(settings) if is_local_archive() else None
-
+    warm = warm_plan(settings) if is_local_archive() else None
     to_fetch = partial + missing
     years = len(settings.year_intervals())
     max_requests = to_fetch * years
@@ -641,12 +641,17 @@ def estimate(settings: Settings) -> dict:
     workers = max(1, settings.workers)
     eta = max_requests * fast / workers
     eta_cold = max_requests * slow / workers
+    if warm and warm["pending"] and not warm["too_big"]:
+        # Measured ~78s of one worker's time per tile-year against a cold area.
+        warm_secs = warm["pending"] * 78.0 / workers
+        eta += warm_secs
+        eta_cold += warm_secs
     return {
         "points": len(points),
         "points_inside": inside,
         "eta_seconds": round(eta),
         "eta_seconds_cold": round(eta_cold),
-        "sync_plan": sync,
+        "warm_plan": warm,
         "over_daily_limit": (not is_local_archive()) and max_requests > DAILY_REQUEST_LIMIT,
         "daily_limit": DAILY_REQUEST_LIMIT,
         "ready": ready,
@@ -672,17 +677,188 @@ def archive_health() -> dict:
                 "error": f"{type(exc).__name__}: {exc}"}
 
 
-# ------------------------------------------------------------ local archive
+# ------------------------------------------------------- area pre-caching
 
-GLOBAL_YEAR_GB = 5.14
+# The archive answers on ERA5's N320 Gaussian grid: successive cell centres come
+# back 0.0703 degrees apart. Probing on that pitch touches every cell in an
+# area, and therefore every stored chunk behind them. Anything coarser leaves
+# gaps that a finer sample grid promptly finds, which is what made two earlier
+# attempts at this useless.
+NATIVE_STEP_DEG = 0.0703
+
+# Areas are pre-cached a square degree at a time, so a later run over an
+# overlapping box reuses the tiles it shares and fetches only the rest.
+WARM_TILE_DEG = 1.0
+
+# Measured: one tile-year, densely probed, costs about this much.
+WARM_MB_PER_TILE_YEAR = 23.7
+
+# One year of global cloud cover in the published archive. Past roughly 217
+# square degrees, syncing whole years costs less than pre-caching the area.
+GLOBAL_YEAR_MB = 5140.0
+
+MAX_WARM_BATCH = 60
 
 
-def sync_plan(settings: Settings) -> dict:
-    years = [int(a[:4]) for a, _ in settings.year_intervals()]
+def tiles_for(settings: Settings) -> list:
+    """Integer-degree tiles covering the selection."""
+    lat0 = math.floor(settings.lat_min / WARM_TILE_DEG) * WARM_TILE_DEG
+    lon0 = math.floor(settings.lon_min / WARM_TILE_DEG) * WARM_TILE_DEG
+    out = []
+    lat = lat0
+    while lat < settings.lat_max:
+        lon = lon0
+        while lon < settings.lon_max:
+            out.append((round(lat, 4), round(lon, 4)))
+            lon += WARM_TILE_DEG
+        lat += WARM_TILE_DEG
+    return out
+
+
+def tile_key(lat: float, lon: float) -> str:
+    return f"{lat:g}_{lon:g}"
+
+
+def tile_points(lat: float, lon: float) -> list:
+    """Probe points covering one tile at the archive's native pitch."""
+    steps = int(round(WARM_TILE_DEG / NATIVE_STEP_DEG)) + 1
+    return [
+        (round(min(lat + i * NATIVE_STEP_DEG, 90.0), 4),
+         round(min(lon + j * NATIVE_STEP_DEG, 180.0), 4))
+        for i in range(steps) for j in range(steps)
+    ]
+
+
+def warmed_path(settings: Settings) -> str:
+    return os.path.join(settings.fast_cache_dir, "warmed_tiles.json")
+
+
+def _normalise_spans(value) -> list:
+    """Accept either a bare [first, last] pair or a list of them."""
+    if not value:
+        return []
+    if isinstance(value[0], (int, float)):
+        return [[int(value[0]), int(value[1])]]
+    return [[int(a), int(b)] for a, b in value]
+
+
+def _merge_spans(spans: list, new: list) -> list:
+    """Union of day ranges, keeping genuinely separate ones separate.
+
+    Collapsing [Jun, Dec] and [Jan, Mar] into [Jan, Dec] would claim April and
+    May were fetched when they never were, and a later run covering them would
+    be skipped.
+    """
+    ordered = sorted(spans + [list(new)])
+    out = [list(ordered[0])]
+    for span in ordered[1:]:
+        if span[0] <= out[-1][1] + 1:
+            out[-1][1] = max(out[-1][1], span[1])
+        else:
+            out.append(list(span))
+    return out
+
+
+def _covers(spans: list, first: int, last: int) -> bool:
+    return any(s[0] <= first and s[1] >= last for s in spans)
+
+
+def read_warmed(settings: Settings) -> dict:
+    """``{tile: {year: [[first_day, last_day], ...]}}`` of what is pre-cached."""
+    try:
+        with open(warmed_path(settings), "r") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_warmed(settings: Settings, additions: dict) -> None:
+    if not additions:
+        return
+    try:
+        settings.ensure_cache_dirs()
+        merged = read_warmed(settings)
+        for tile, years in additions.items():
+            slot = merged.setdefault(tile, {})
+            for year, span in years.items():
+                slot[year] = _merge_spans(_normalise_spans(slot.get(year)), span)
+        path = warmed_path(settings)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(merged, fh)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def pending_tiles(settings: Settings) -> list:
+    """(tile_lat, tile_lon, year, start, end) still to pre-cache.
+
+    Reuse is per tile *and* per year, so widening the box or extending the date
+    range only fetches the parts that are genuinely new.
+    """
+    if not is_local_archive():
+        return []
+    warmed = read_warmed(settings)
+    out = []
+    for lat, lon in tiles_for(settings):
+        slot = warmed.get(tile_key(lat, lon), {})
+        for y_start, y_end in settings.year_intervals():
+            year = y_start[:4]
+            first, last = _day_num(y_start), _day_num(y_end)
+            if first is None or last is None:
+                continue
+            if _covers(_normalise_spans(slot.get(year)), first, last):
+                continue
+            out.append((lat, lon, year, y_start, y_end))
+    return out
+
+
+def warm_plan(settings: Settings) -> dict:
+    """Cost of pre-caching what is missing, against syncing whole years."""
+    pending = pending_tiles(settings)
+    total_tiles = len(tiles_for(settings))
+    years = max(1, len(settings.year_intervals()))
+    warm_mb = len(pending) * WARM_MB_PER_TILE_YEAR
+    sync_mb = years * GLOBAL_YEAR_MB
     return {
-        "years": years,
-        "range": f"{min(years)}-{max(years)}" if years else "",
-        "gb": round(len(years) * GLOBAL_YEAR_GB, 1),
-        "command": ("docker compose run --rm openmeteo sync copernicus_era5 "
-                    f"cloud_cover --year {min(years)}-{max(years)}" if years else ""),
+        "tiles": total_tiles,
+        "pending": len(pending),
+        "already": total_tiles * years - len(pending),
+        "warm_mb": round(warm_mb),
+        "sync_mb": round(sync_mb),
+        "too_big": warm_mb >= sync_mb,
+        "sync_command": ("docker compose run --rm openmeteo sync copernicus_era5 "
+                         f"cloud_cover --year {settings.start.year}-{settings.end.year}"),
     }
+
+
+def run_warm_tile(task):
+    """Pool worker: pull one tile-year, densely, in a few batched requests.
+
+    Nothing is stored our side; the request exists for the side effect of the
+    archive caching the chunks it had to read.
+    """
+    settings, index, lat, lon, year, start, end, run_id = task
+    diagnostics.enable_faulthandler("worker")
+    log = diagnostics.run_logger(run_id)
+    points = tile_points(lat, lon)
+    try:
+        client = openmeteo_requests.Client(session=_plain_session())
+        for i in range(0, len(points), MAX_WARM_BATCH):
+            chunk = points[i:i + MAX_WARM_BATCH]
+            client.weather_api(ARCHIVE_URL, params={
+                "latitude": [p[0] for p in chunk],
+                "longitude": [p[1] for p in chunk],
+                "start_date": start,
+                "end_date": end,
+                "hourly": "cloud_cover",
+            })
+        return index, None
+    except Exception as exc:
+        msg = f"tile {lat},{lon} {year}: {type(exc).__name__}: {exc}"
+        log.warning("WARM FAILED %s", msg)
+        return index, msg
+
+

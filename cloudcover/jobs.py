@@ -187,6 +187,66 @@ def _drain(job: Job, points, per_point, pending: list[int], log) -> set[int]:
     return remaining
 
 
+def _precache_area(job: Job, log) -> None:
+    """Pull the whole selected area into the local archive before sampling it.
+
+    Sampling fetches points, so a later run at a finer resolution lands between
+    the chunks the coarser one pulled and downloads cold again. Pre-caching the
+    area a square degree at a time fixes that for good: reuse is tracked per
+    tile and per year, so widening the box or extending the dates only fetches
+    the genuinely new part.
+    """
+    plan = fetch.warm_plan(job.settings)
+    if plan["too_big"]:
+        log.info("area too large to pre-cache (%.1f GB vs %.1f GB to sync whole "
+                 "years); skipping, run: %s",
+                 plan["warm_mb"] / 1000, plan["sync_mb"] / 1000, plan["sync_command"])
+        return
+    pending = fetch.pending_tiles(job.settings)
+    if not pending:
+        log.info("area already cached: %d tile-years", plan["already"])
+        return
+
+    job.begin_phase("Caching the selected area", len(pending))
+    log.info("pre-caching %d tile-years (%d already cached), about %.1f GB",
+             len(pending), plan["already"], plan["warm_mb"] / 1000)
+
+    settings = job.settings
+    ctx = multiprocessing.get_context("spawn")
+    pool = ProcessPoolExecutor(max_workers=settings.workers, mp_context=ctx)
+    done = {}
+    try:
+        futures = {
+            pool.submit(fetch.run_warm_tile,
+                        (settings, i, lat, lon, year, start, end, job.id)): i
+            for i, (lat, lon, year, start, end) in enumerate(pending)
+        }
+        for future in as_completed(futures):
+            if job.cancelled():
+                break
+            index, failure = future.result()
+            lat, lon, year, start, end = pending[index]
+            if failure:
+                job.note_failure(failure)
+            else:
+                key = fetch.tile_key(lat, lon)
+                done.setdefault(key, {})[year] = [fetch._day_num(start),
+                                                  fetch._day_num(end)]
+            job.tick()
+    except BrokenProcessPool as exc:
+        # Not fatal: sampling will simply fetch whatever is still cold.
+        log.warning("pre-cache pool died (%s); continuing", exc)
+    finally:
+        try:
+            pool.shutdown(wait=not job.cancelled(), cancel_futures=True)
+        except Exception:
+            pass
+        # Record partial progress too, so a cancelled run still counts.
+        fetch.write_warmed(settings, done)
+    log.info("pre-cached %d of %d tile-years", sum(len(v) for v in done.values()),
+             len(pending))
+
+
 def _read_cache(job: Job, points, per_point, log) -> list[int]:
     """Load everything already on disk, in this process. Returns points still
     needing a download.
@@ -262,6 +322,11 @@ def _run(job: Job) -> None:
     settings.ensure_cache_dirs()
 
     try:
+        _precache_area(job, log)
+        if job.cancelled():
+            job.status = "cancelled"
+            job.phase = "Cancelled"
+            return
         pending = _read_cache(job, points, per_point, log)
         if pending and not job.cancelled():
             _download(job, points, per_point, pending, log)

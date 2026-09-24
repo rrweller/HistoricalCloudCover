@@ -440,10 +440,20 @@ async function runEstimate() {
     if (data.to_fetch) {
       notes.push(`Up to ${fmtInt(data.max_requests)} archive requests across ${data.years} year${data.years === 1 ? '' : 's'}.`);
       notes.push('Each point is written to disk as it finishes, so an interrupted run resumes where it stopped.');
-      if (data.sync_plan) {
-        notes.push(`Points are fetched individually, so raising the grid resolution later `
-          + `re-downloads. To make this box free at any resolution, sync the years once `
-          + `(~${data.sync_plan.gb} GB): ${data.sync_plan.command}`);
+      if (data.warm_plan && data.warm_plan.too_big) {
+        notes.push(`This area is too large to cache tile by tile `
+          + `(~${Math.round(data.warm_plan.warm_mb / 1000)} GB, against `
+          + `${Math.round(data.warm_plan.sync_mb / 1000)} GB to sync whole years), so it `
+          + `will be sampled point by point. To make it free at any resolution run: `
+          + data.warm_plan.sync_command);
+      } else if (data.warm_plan && data.warm_plan.pending) {
+        notes.push(`First it caches the selected area itself `
+          + `(${fmtInt(data.warm_plan.pending)} tile-years, about `
+          + `${(data.warm_plan.warm_mb / 1000).toFixed(1)} GB`
+          + (data.warm_plan.already ? `; ${fmtInt(data.warm_plan.already)} already cached` : '')
+          + '), after which any grid resolution over this box is free.');
+      } else if (data.warm_plan) {
+        notes.push('The whole selected area is already cached locally.');
       }
     }
     els['est-note'].textContent = notes.join(' ');

@@ -136,33 +136,39 @@ A cold region is *slower* than the public API, because the container pulls from
 S3 while open-meteo.com serves from its own warm storage. You win from the second
 query onward, and never hit a quota.
 
-### On-demand caching is per point, not per area
+### The selected area is cached, not just the sample points
 
-Points are fetched individually, so **raising the grid resolution over the same
-box downloads cold again** — the finer grid lands between the chunks the coarser
-one pulled. Measured on one 4 x 4 degree box:
+Sampling fetches individual points, so a finer grid over the same box would land
+between the chunks the coarser one pulled and download cold all over again. To
+stop that, a run first pre-caches the **whole selection**, a square degree at a
+time, probing at the archive's native pitch.
 
-| grid | points | pulled |
-|---|---|---|
-| 5 x 5 | 25 | 31 MB |
-| 9 x 9, same box | 81 | +28 MB |
-| 15 x 15, same box | 225 | +68 MB |
+Reuse is tracked per tile *and* per year, so an overlapping box or a longer date
+range only fetches the genuinely new part. Measured on a fresh 2 x 2 degree box:
 
-Prefetching just the box looks like the fix and is not: the archive serves ERA5
-on its N320 Gaussian grid at about **0.0703 degrees** — successive cells come
-back as 15.00879, 15.07909, 15.14938 — so a 2 x 2 degree box holds ~840 cells and
-Europe ~355,000. Enumerating them costs far more than whole years, and any cell
-missed is a cold spot the next finer grid finds.
+| step | tile-years to fetch | reused | pulled |
+|---|---|---|---|
+| fresh box, 5 x 5 grid, 2022 | 4 | 0 | 50.1 MB |
+| same box, 15 x 15 grid | 0 | 4 | **1.2 MB** |
+| same box, 25 x 25 grid | 0 | 4 | **1.5 MB** |
+| box shifted, quarter overlap | 3 | **1** | 22.7 MB |
+| original box, one more year | 4 | **4** | 42.5 MB |
+| original box, both years | 0 | 8 | **0.8 MB** |
 
-### Syncing years is the fix
+The pitch matters: the archive answers on ERA5's N320 Gaussian grid at about
+**0.0703 degrees** — successive cell centres come back as 15.00879, 15.07909,
+15.14938 — not the 0.25 the dataset is usually described with. Two earlier
+attempts at a coarser lattice each left cold spots that the next finer grid
+promptly found.
+
+Pre-caching costs about **23.7 MB per square degree per year**. Past roughly 15
+degrees square that exceeds the 5.14 GB per year of simply syncing whole years,
+so beyond that the app stops pre-caching, samples point by point, and tells you
+the sync command instead:
 
 ```
 python app.py --sync-years 2019-2024
 ```
-
-About **5.14 GB per year**. Once done, every point is local at any resolution,
-for any region, and runs go at roughly 37 year-fetches/second. The footer shows
-the exact command for the range you have selected.
 
 With a self-hosted archive there is no quota: the daily-budget warning disappears
 and the worker ceiling rises from 12 to 64.
