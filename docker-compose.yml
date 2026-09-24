@@ -1,0 +1,40 @@
+# Self-hosted Open-Meteo archive.
+#
+# Serves the same HTTP API as the public open-meteo.com, so the app only needs
+# CLOUDCOVER_ARCHIVE_URL pointed here — no quota, no minutely/hourly/daily caps,
+# no concurrency ceiling.
+#
+#   docker compose up -d
+#   CLOUDCOVER_ARCHIVE_URL=http://127.0.0.1:8080/v1/archive python app.py
+#
+# In this default mode nothing is pre-downloaded: the server reads individual
+# chunks out of the S3 archive over HTTP range requests as queries ask for them,
+# and keeps what it has fetched in CACHE_SIZE of local disk. Query Europe and you
+# pull Europe's chunks, not the globe.
+#
+# If you would rather hold whole years locally — worth it once you are hammering
+# the same region repeatedly, since it avoids a great many small range requests:
+#
+#   docker compose run --rm openmeteo sync copernicus_era5 cloud_cover --past-days 2190
+#
+# Cloud cover runs about 5.1 GB per year globally (443 GB for the full 1940-today
+# archive), so six years is roughly 31 GB.
+
+services:
+  openmeteo:
+    image: ghcr.io/open-meteo/open-meteo
+    container_name: open-meteo
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - open-meteo-data:/app/data
+    environment:
+      # Read chunks straight from the public archive, on demand.
+      REMOTE_DATA_DIRECTORY: https://openmeteo.s3.amazonaws.com/data/
+      # Local disk given over to caching those chunks. Raise it if you work
+      # across several large regions.
+      CACHE_SIZE: 16GB
+
+volumes:
+  open-meteo-data:

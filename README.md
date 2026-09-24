@@ -82,17 +82,70 @@ different definition of night. Each mode therefore gets its own namespace
 (`astro`, `night`, `all24`) and switching between them refetches. The `_fast`
 directory is derived — delete it any time and it rebuilds.
 
-## Rate limits
+## Running your own archive (recommended)
 
-Open-Meteo's free tier allows roughly 10,000 requests/day and 5,000/hour, refuses
-bursts above about eight at once, and weights each request by how much data it
-covers. *Parallel requests* defaults to 4. A run needs one request per point per
-year, so a 60 × 60 grid over six years is 21,600 requests — more than a day's
-allowance. The footer warns when an estimate exceeds it, and because progress is
-saved per point you can simply run again the next day.
+The public tier is the slow part, not the data. Open-Meteo publish their whole
+archive as open data plus a Docker image of the API server, and it serves the
+*same* HTTP API — so the app only needs pointing at it.
+
+```
+docker compose up -d
+python app.py --archive-url http://127.0.0.1:8080/v1/archive
+```
+
+or set `CLOUDCOVER_ARCHIVE_URL` in the environment. The startup banner says which
+archive is in use, and `GET /api/archive` reports whether it is reachable.
+
+Nothing is pre-downloaded. OM-files are chunked spatially *and* temporally —
+roughly 3 x 3 grid cells by 120 timesteps, one to two kilobytes each — and the
+server pulls individual chunks out of S3 with HTTP range requests as queries ask
+for them, keeping what it fetched in `CACHE_SIZE` of local disk. Query Europe and
+you pull Europe's chunks, not the globe.
+
+(This is worth contrasting with ARCO-ERA5 on Google Cloud, which looks like the
+obvious choice and is not: it is chunked `[1, 721, 1440]`, one whole global field
+per hour, so extracting a 4 x 4 degree box over six years means pulling about
+218 GB.)
+
+Measured on a 25-point, 3-year job (4 x 4 degree box, 8 workers):
+
+| | time | downloaded |
+|---|---|---|
+| Cold region, chunks fetched on demand | 42s | **37 MB** |
+| Same region again, archive warm | **2.0s** | 0 MB |
+| Public tier, for comparison | ~8s | n/a, but quota-limited |
+
+37 MB against the 5,140 MB a single global year weighs — about 0.24% — which is
+the chunk-level fetching doing its job. Note the trade: a cold region is *slower*
+than the public API, because the container is pulling from S3 while open-meteo.com
+serves from its own warm storage. You win from the second query onward, and you
+never hit a quota.
+
+Once you are working the same region repeatedly, or facing one large cold run,
+holding whole years locally removes the first-touch penalty entirely:
+
+```
+docker compose run --rm openmeteo sync copernicus_era5 cloud_cover --past-days 2190
+```
+
+Cloud cover is about 5.1 GB per year globally — 443 GB for the full 1940-today
+archive — so six years is roughly 31 GB.
+
+With a self-hosted archive there is no quota: the daily-budget warning disappears
+and the worker ceiling rises from 12 to 64.
+
+## Rate limits on the public tier
+
+Roughly 10,000 requests/day and 5,000/hour, bursts above about eight at once are
+refused, and each request is weighted by how much data it covers. *Parallel
+requests* defaults to 4. A run needs one request per point per year, so a 60 x 60
+grid over six years is 21,600 requests — more than a day's allowance. The footer
+warns when an estimate exceeds it, and because progress is saved per point you
+can run again the next day.
 
 Measured throughput is about **2 point-years per second per connection**, and it
 is data-volume-bound: batching many locations into one request does not help.
+Paid plans start at $29/month for 1M calls if you would rather not self-host.
 
 ## When something goes wrong
 
@@ -121,6 +174,7 @@ layout, so it does not share the web app's namespaces.
 
 ```
 app.py                  Flask routes and the JSON API
+docker-compose.yml      Self-hosted Open-Meteo archive
 cloudcover/
   config.py             Settings model, grid construction, cache paths
   solar.py              Solar position; astronomical night and sunset thresholds

@@ -29,7 +29,21 @@ from . import diagnostics
 from .config import Settings
 from .solar import ASTRONOMICAL_DEPRESSION, HORIZON_DEPRESSION, sun_below
 
-ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+PUBLIC_ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+# Point this at a self-hosted Open-Meteo instance to escape the public tier's
+# rate limits. The container serves the identical API, so nothing else changes.
+#   docker compose up -d   ->   http://127.0.0.1:8080/v1/archive
+ARCHIVE_URL = os.environ.get("CLOUDCOVER_ARCHIVE_URL", PUBLIC_ARCHIVE_URL)
+
+
+def is_local_archive() -> bool:
+    """True when we are talking to something other than the public tier.
+
+    Self-hosted instances have no quota, so the daily-budget warning and the
+    small worker ceiling both stop applying.
+    """
+    return ARCHIVE_URL != PUBLIC_ARCHIVE_URL
 HTTP_CACHE = ".requests_http_cache"
 
 MAX_ATTEMPTS = 5
@@ -603,13 +617,15 @@ def estimate(settings: Settings) -> dict:
     to_fetch = partial + missing
     years = len(settings.year_intervals())
     max_requests = to_fetch * years
-    # Rough wall-clock guess: one request per worker at a time, ~0.7 s each.
-    eta = max_requests * 0.7 / max(1, settings.workers)
+    # Rough wall-clock guess: one request per worker at a time. A local archive
+    # answers from local disk or a warm chunk cache, so it is far quicker.
+    per_request = 0.12 if is_local_archive() else 0.7
+    eta = max_requests * per_request / max(1, settings.workers)
     return {
         "points": len(points),
         "points_inside": inside,
         "eta_seconds": round(eta),
-        "over_daily_limit": max_requests > DAILY_REQUEST_LIMIT,
+        "over_daily_limit": (not is_local_archive()) and max_requests > DAILY_REQUEST_LIMIT,
         "daily_limit": DAILY_REQUEST_LIMIT,
         "ready": ready,
         "unverified": unverified,
@@ -620,3 +636,15 @@ def estimate(settings: Settings) -> dict:
         "max_requests": to_fetch * years,
         "nights": span,
     }
+
+
+def archive_health() -> dict:
+    """Ping the configured archive with a one-day, one-point request."""
+    began = time.monotonic()
+    try:
+        times, _ = _request_year(52.0, 5.0, "2023-01-01", "2023-01-01")
+        return {"ok": True, "url": ARCHIVE_URL, "local": is_local_archive(),
+                "hours": len(times), "seconds": round(time.monotonic() - began, 3)}
+    except Exception as exc:
+        return {"ok": False, "url": ARCHIVE_URL, "local": is_local_archive(),
+                "error": f"{type(exc).__name__}: {exc}"}

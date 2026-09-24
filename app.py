@@ -98,6 +98,11 @@ def bootstrap():
     return jsonify(
         {
             "defaults": defaults.to_dict(),
+            "archive": {
+                "url": fetch.ARCHIVE_URL,
+                "local": fetch.is_local_archive(),
+                "max_workers": 64 if fetch.is_local_archive() else 12,
+            },
             "night_modes": [
                 {"key": "astronomical",
                  "label": "Astronomical night only",
@@ -254,6 +259,11 @@ def export_png(job_id):
                      as_attachment=True, download_name=name)
 
 
+@app.get("/api/archive")
+def archive_status():
+    return jsonify(fetch.archive_health())
+
+
 @app.get("/api/logs")
 def list_logs():
     return jsonify({"dir": os.path.abspath(diagnostics.LOG_DIR),
@@ -299,11 +309,24 @@ def main():
     parser.add_argument("--port", type=int, default=5000)
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--archive-url",
+        help="Base archive endpoint. Point at a self-hosted Open-Meteo "
+             "(http://127.0.0.1:8080/v1/archive) to drop the public rate limits.",
+    )
     args = parser.parse_args()
+
+    if args.archive_url:
+        # Set before anything forks: worker processes inherit the environment.
+        os.environ["CLOUDCOVER_ARCHIVE_URL"] = args.archive_url
+        fetch.ARCHIVE_URL = args.archive_url
 
     url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '') else args.host}:{args.port}"
     print(f"\n  Cloud Cover Explorer  ->  {url}")
-    print(f"  Run + crash logs      ->  {os.path.abspath(diagnostics.LOG_DIR)}\n")
+    print(f"  Run + crash logs      ->  {os.path.abspath(diagnostics.LOG_DIR)}")
+    tier = "self-hosted, no quota" if fetch.is_local_archive() else "public tier"
+    print(f"  Archive               ->  {fetch.ARCHIVE_URL}  ({tier})")
+    print()
     if not args.no_browser and not args.debug:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     threading.Thread(target=_prewarm_basemap, name="prewarm", daemon=True).start()

@@ -34,6 +34,13 @@ FAST_DIRNAME = "_fast"  # binary mirror of the JSON caches, for quick reloads
 MIN_DATE = date(1940, 1, 1)  # Open-Meteo ERA5 archive start
 
 
+def _worker_ceiling() -> int:
+    """The public tier refuses bursts above ~8; a self-hosted one has no limit."""
+    from .fetch import is_local_archive  # lazy: config must not import fetch at load
+
+    return 64 if is_local_archive() else 12
+
+
 class SettingsError(ValueError):
     """Raised when incoming settings cannot produce a valid run."""
 
@@ -106,8 +113,9 @@ class Settings:
             raise SettingsError("Grid resolution must be between 2 and 200")
         if self.night_mode not in NIGHT_MODES:
             raise SettingsError("Night mode must be 'astronomical' or 'all'")
-        if not (1 <= self.workers <= 12):
-            raise SettingsError("Workers must be between 1 and 12")
+        ceiling = _worker_ceiling()
+        if not (1 <= self.workers <= ceiling):
+            raise SettingsError(f"Workers must be between 1 and {ceiling}")
 
         start, end = self.start, self.end
         if start > end:
