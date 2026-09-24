@@ -427,12 +427,23 @@ async function runEstimate() {
     els['est-cached'].textContent = fmtInt(data.ready + data.unverified);
     els['est-fetch'].textContent = data.to_fetch ? `${fmtInt(data.to_fetch)} points` : 'nothing';
 
-    els['est-time'].textContent = data.to_fetch ? `~${fmtDuration(data.eta_seconds)}` : 'seconds';
+    // A self-hosted archive reports a range: the first pass over a region has
+    // to pull its chunks, every pass after that is served from local cache.
+    const spread = data.eta_seconds_cold && data.eta_seconds_cold > data.eta_seconds * 1.5;
+    els['est-time'].textContent = !data.to_fetch
+      ? 'seconds'
+      : spread
+        ? `${fmtDuration(data.eta_seconds)} - ${fmtDuration(data.eta_seconds_cold)}`
+        : `~${fmtDuration(data.eta_seconds)}`;
 
     const notes = [];
     if (data.to_fetch) {
       notes.push(`Up to ${fmtInt(data.max_requests)} archive requests across ${data.years} year${data.years === 1 ? '' : 's'}.`);
       notes.push('Each point is written to disk as it finishes, so an interrupted run resumes where it stopped.');
+      if (spread) {
+        notes.push('The upper figure is a region the local archive has not cached yet;'
+          + ' the lower one is a region it has.');
+      }
     } else {
       notes.push('Everything is on disk — this run will finish in seconds.');
     }

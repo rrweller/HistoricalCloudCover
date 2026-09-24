@@ -619,12 +619,21 @@ def estimate(settings: Settings) -> dict:
     max_requests = to_fetch * years
     # Rough wall-clock guess: one request per worker at a time. A local archive
     # answers from local disk or a warm chunk cache, so it is far quicker.
-    per_request = 0.12 if is_local_archive() else 0.7
-    eta = max_requests * per_request / max(1, settings.workers)
+    # Measured seconds of one worker's time per request. A self-hosted archive
+    # is ~20x quicker once its chunks are cached than on first touch, so both
+    # ends are reported rather than a single figure that is wrong half the time.
+    if is_local_archive():
+        fast, slow = 0.25, 4.5
+    else:
+        fast = slow = 0.35
+    workers = max(1, settings.workers)
+    eta = max_requests * fast / workers
+    eta_cold = max_requests * slow / workers
     return {
         "points": len(points),
         "points_inside": inside,
         "eta_seconds": round(eta),
+        "eta_seconds_cold": round(eta_cold),
         "over_daily_limit": (not is_local_archive()) and max_requests > DAILY_REQUEST_LIMIT,
         "daily_limit": DAILY_REQUEST_LIMIT,
         "ready": ready,
