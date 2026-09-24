@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cloud Cover Explorer</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+</head>
+<body>
+
+<div class="app">
+
+  <!-- ══════════════════════════════ SIDEBAR ══════════════════════════════ -->
+  <aside class="panel">
+    <header class="brand">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M7 18h9.5a3.5 3.5 0 0 0 .4-6.98A5 5 0 0 0 7.6 9.2 4 4 0 0 0 7 18Z"
+              fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+        <circle cx="18.5" cy="6.5" r="2.4" fill="none" stroke="currentColor" stroke-width="1.6"/>
+      </svg>
+      <div class="brand-text">
+        <h1>Cloud Cover Explorer</h1>
+        <p>Historical nighttime cloud cover, by area</p>
+      </div>
+    </header>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab is-active" data-tab="setup" role="tab">Setup</button>
+      <button class="tab" data-tab="results" role="tab" disabled>Results</button>
+    </nav>
+
+    <div class="panel-body">
+
+      <!-- ─────────────────────────── SETUP TAB ─────────────────────────── -->
+      <div class="tab-panel is-active" id="tab-setup">
+
+        <section class="card">
+          <div class="card-head">
+            <h2>Area</h2>
+            <button class="link-btn" id="btn-draw" title="Drag on the map to draw a new box">Draw on map</button>
+          </div>
+
+          <div class="compass">
+            <div class="compass-cell compass-n">
+              <label class="mini">
+                <span>North</span>
+                <input type="number" id="lat_max" step="0.5" min="-90" max="90">
+              </label>
+            </div>
+            <div class="compass-cell compass-w">
+              <label class="mini">
+                <span>West</span>
+                <input type="number" id="lon_min" step="0.5" min="-180" max="180">
+              </label>
+            </div>
+            <div class="compass-cell compass-mid" id="compass-size">—</div>
+            <div class="compass-cell compass-e">
+              <label class="mini">
+                <span>East</span>
+                <input type="number" id="lon_max" step="0.5" min="-180" max="180">
+              </label>
+            </div>
+            <div class="compass-cell compass-s">
+              <label class="mini">
+                <span>South</span>
+                <input type="number" id="lat_min" step="0.5" min="-90" max="90">
+              </label>
+            </div>
+          </div>
+
+          <label class="field">
+            <span class="field-label">
+              Sample grid
+              <b class="field-value" id="res-value">20 × 20</b>
+            </span>
+            <input type="range" id="grid_resolution" min="4" max="100" step="1">
+            <span class="hint" id="res-hint"></span>
+          </label>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2>Date range</h2></div>
+          <div class="row">
+            <label class="field">
+              <span class="field-label">From</span>
+              <input type="date" id="start_date" min="1940-01-01">
+            </label>
+            <label class="field">
+              <span class="field-label">To</span>
+              <input type="date" id="end_date" min="1940-01-01">
+            </label>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-head"><h2>Hours counted</h2></div>
+          <div class="segmented segmented--stack" id="night-mode">
+            <button data-mode="astronomical" class="seg is-active">Astronomical night only</button>
+            <button data-mode="night" class="seg">Sun below the horizon</button>
+            <button data-mode="all" class="seg">Full 24 hours</button>
+          </div>
+          <span class="hint" id="night-hint"></span>
+        </section>
+
+        <section class="card card--collapsed" id="card-advanced">
+          <div class="card-head is-toggle" data-toggle="card-advanced">
+            <h2>Advanced</h2>
+            <span class="caret" aria-hidden="true">▾</span>
+          </div>
+          <div class="card-content">
+            <label class="field">
+              <span class="field-label">Parallel requests <b class="field-value" id="workers-value">4</b></span>
+              <input type="range" id="workers" min="1" max="12" step="1">
+              <span class="hint">Open-Meteo starts refusing bursts above about 8 at once.</span>
+            </label>
+            <label class="field">
+              <span class="field-label">Interpolation</span>
+              <select id="method">
+                <option value="cubic">Cubic (smoothest)</option>
+                <option value="linear">Linear</option>
+                <option value="nearest">Nearest (raw cells)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="field-label">Render detail <b class="field-value" id="detail-value">520 px</b></span>
+              <input type="range" id="resolution" min="160" max="1200" step="40" value="520">
+            </label>
+          </div>
+        </section>
+
+      </div>
+
+      <!-- ────────────────────────── RESULTS TAB ────────────────────────── -->
+      <div class="tab-panel" id="tab-results">
+
+        <section class="card">
+          <div class="card-head"><h2>Export</h2></div>
+          <button class="btn btn--ghost" id="btn-png">Map PNG</button>
+          <p class="hint" id="run-meta"></p>
+        </section>
+
+      </div>
+    </div>
+
+    <footer class="panel-foot">
+      <div class="estimate" id="estimate">
+        <div class="estimate-row"><span>Sample points</span><b id="est-points">—</b></div>
+        <div class="estimate-row"><span>Already cached</span><b id="est-cached">—</b></div>
+        <div class="estimate-row"><span>Needs downloading</span><b id="est-fetch">—</b></div>
+        <div class="estimate-row"><span>Estimated time</span><b id="est-time">—</b></div>
+        <p class="hint" id="est-note"></p>
+      </div>
+
+      <div class="progress" id="progress" hidden>
+        <div class="progress-head">
+          <span id="progress-phase">Working…</span>
+          <span id="progress-pct">0%</span>
+        </div>
+        <div class="progress-track"><div class="progress-bar" id="progress-bar"></div></div>
+        <div class="progress-meta"><span id="progress-count">—</span><span id="progress-eta"></span></div>
+      </div>
+
+      <div class="alert" id="alert" hidden></div>
+
+      <button class="btn btn--primary" id="btn-run">Run analysis</button>
+      <button class="btn btn--danger" id="btn-cancel" hidden>Cancel run</button>
+    </footer>
+  </aside>
+
+  <!-- ═══════════════════════════════ MAP ════════════════════════════════ -->
+  <main class="stage">
+    <div id="map"></div>
+
+    <div class="map-hint" id="map-hint">Drag the box handles to change the area, or hit <b>Draw on map</b>.</div>
+
+    <div class="viewbar" id="viewbar" hidden>
+      <div class="viewbar-row">
+        <label class="mini mini--wide">
+          <span>Colour</span>
+          <select id="colormap">
+            <option value="blue">Blue</option>
+            <option value="viridis">Viridis</option>
+            <option value="magma">Magma</option>
+            <option value="ylgnbu">YlGnBu</option>
+            <option value="greys">Greys</option>
+          </select>
+        </label>
+        <label class="mini mini--wide">
+          <span>Shading</span>
+          <select id="bands">
+            <option value="0">Smooth</option>
+            <option value="10" selected>10 bands</option>
+            <option value="20">20 bands</option>
+            <option value="5">5 bands</option>
+          </select>
+        </label>
+      </div>
+      <div class="viewbar-row">
+        <label class="mini mini--wide">
+          <span>Opacity <b id="opacity-value">85%</b></span>
+          <input type="range" id="opacity" min="20" max="100" step="5" value="85">
+        </label>
+      </div>
+      <div class="viewbar-row viewbar-toggles">
+        <label class="check check--sm"><input type="checkbox" id="show-scale"><span>Full 0–100% scale</span></label>
+        <label class="check check--sm"><input type="checkbox" id="show-points"><span>Sample points</span></label>
+      </div>
+    </div>
+
+    <div class="timebar" id="timebar" hidden>
+      <div class="timebar-head">
+        <span class="timebar-label" id="timebar-label">All year</span>
+        <div class="segmented segmented--sm" id="granularity">
+          <button data-gran="season" class="seg is-active">Seasons</button>
+          <button data-gran="month" class="seg">Months</button>
+        </div>
+      </div>
+      <input type="range" id="timeslider" min="0" max="4" step="1" value="0">
+      <div class="timebar-ticks" id="timebar-ticks"></div>
+    </div>
+
+    <div class="map-note" id="map-note" hidden></div>
+
+    <div class="legend" id="legend" hidden>
+      <div class="legend-title" id="legend-title">Mean cloud cover</div>
+      <canvas id="legend-canvas" width="220" height="12"></canvas>
+      <div class="legend-scale"><span id="legend-min">0%</span><span id="legend-max">100%</span></div>
+    </div>
+  </main>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
